@@ -1,34 +1,34 @@
 import json
-import requests
 
-def get_user(username, base_url="https://api2.warera.io/trpc/search.searchAnything"):
+PLAYER_CACHE = {}
+
+async def get_user(username, session, base_url="https://api2.warera.io/trpc/search.searchAnything"):
+    if username in PLAYER_CACHE.keys():
+        user = await get_user_info(PLAYER_CACHE[username], session)
+        return user
+
     input_data = { 'searchText': username}
     params = { "input" : json.dumps(input_data)}
-    response = requests.get(base_url, params=params, headers={
-        "Accept": "*/*",
-        "Content-Type": "application/json"
-    })
-    response.raise_for_status()
-    api_result = response.json()['result']['data']
-    if api_result['hasData'] is False:
+    async with session.get(base_url, params=params) as response:
+        response.raise_for_status()
+        data = await response.json()
+    api_result = data.get('result', {}).get('data')
+    if not api_result or api_result['hasData'] is False:
         return None
-    
-    if len(api_result['userIds']) == 0:
-        return None
-    
-    for userId in api_result['userIds']:
-        user = get_user_info(userId)
+    for userId in api_result.get('userIds', []):
+        user = await get_user_info(userId, session)
         if username == user['username']:
+            PLAYER_CACHE[username] = user['_id']
             return user
     return None
 
-def get_user_info(userId, base_url="https://api2.warera.io/trpc/user.getUserLite"):
+async def get_user_info(userId, session, base_url="https://api2.warera.io/trpc/user.getUserLite"):
     input_data = { 'userId': userId}
     params = { "input" : json.dumps(input_data)}
-    response = requests.get(base_url, params=params, headers={
-        "Accept": "*/*",
-        "Content-Type": "application/json"
-    })
-    response.raise_for_status()
-    api_result = response.json()['result']['data']
+    async with session.get(base_url, params=params) as response:
+        response.raise_for_status()
+        data = await response.json()
+    api_result = data.get('result', {}).get('data')
+    if not api_result:
+        return None
     return api_result
