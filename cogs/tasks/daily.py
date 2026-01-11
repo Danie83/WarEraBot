@@ -1,4 +1,5 @@
 import aiohttp
+import discord
 from discord.ext import commands, tasks
 from utils.api import get_user
 from utils.computational import triangular
@@ -10,13 +11,20 @@ class DailyTasks(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.cached_members = {}
-        self.daily_job.start()
+        self.skill_roles.start()
+        self.military_unit_roles.start()
+        self.unidentified_members.start()
 
     def cog_unload(self):
-        self.daily_job.cancel()
+        self.skill_roles.cancel()
+        self.military_unit_roles.cancel()
+        self.unidentified_members.cancel()
 
     @tasks.loop(hours=24)
-    async def daily_job(self):
+    async def skill_roles(self):
+        """Parses all members of the server that hold the citizen role and assigns
+           roles based on their assigned skills (economy or fighter)
+        """
         guild = self.bot.get_guild(config['guild'])
         citizen = guild.get_role(config['roles']['citizen'])
         economy_role = guild.get_role(config['roles']['economy'])
@@ -63,9 +71,84 @@ class DailyTasks(commands.Cog):
                 
                 self.cached_members[member.id] = is_economy
 
-    @daily_job.before_loop
-    async def before_daily_job(self):
+    @skill_roles.before_loop
+    async def before_skill_roles(self):
         await self.bot.wait_until_ready()
+
+    @tasks.loop(hours=24)
+    async def military_unit_roles(self):
+        """Parses all members of the server that hold the citizen role and assigns
+           military unit roles based on the available MU server roles available.
+        """
+        guild = self.bot.get_guild(config['guild'])
+        citizen = guild.get_role(config['roles']['citizen'])
+        military_units = config['military_units']
+        mu_to_role = {unit['id'] : guild.get_role(unit['roleId']) for unit in military_units}
+
+        members = citizen.members
+        async with aiohttp.ClientSession() as session:
+            for member in members:
+                user = await get_user(member.display_name, session)
+                if user is None or "mu" not in user.keys():
+                    continue
+                role = mu_to_role.get(user["mu"])
+                if role is None:
+                    continue
+                if role in member.roles:
+                    continue
+                roles_to_remove = [
+                    r for r in mu_to_role.values()
+                    if r and r in member.roles and r != role
+                ]
+                await member.add_roles(role, reason="Assigned Military Unit role.")
+                if roles_to_remove:
+                    await member.remove_roles(*roles_to_remove, reason="Removed unused Military Unit roles.")
+
+    @military_unit_roles.before_loop
+    async def before_military_unit_roles(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(hours=24)
+    async def unidentified_members(self):
+        """Parses all members of the server that hold the citizen role and checks
+           if their server nickname matches the one from the game.
+        """
+        guild = self.bot.get_guild(config['guild'])
+        citizen = guild.get_role(config['roles']['citizen'])
+        unidentified = []
+        async with aiohttp.ClientSession() as session:
+            for member in citizen.members:
+                user = await get_user(member.display_name, session)
+                if user is None:
+                    unidentified.append(member)
+                    continue
+            if len(unidentified) == 0:
+                return
+            channel = guild.get_channel(config["channels"]["reports"])
+            embed = self.build_unidentified_embed(unidentified)
+            await channel.send(embed=embed)
+
+    @unidentified_members.before_loop
+    async def before_unidentified_members(self):
+        await self.bot.wait_until_ready()
+        
+    def build_unidentified_embed(self, members: list[discord.Member]) -> discord.Embed:
+        embed = discord.Embed(
+            title="Unidentified Players Found",
+            description="The following members could not be matched:",
+            color=discord.Color.orange()
+        )
+        lines = [f"* {m.display_name} ('{m.id}')" for m in members]
+        chunk = ""
+        for line in lines:
+            if len(chunk) + len(line) > 1000:
+                embed.add_field(name="Players", value=chunk, inline=False)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
+            embed.add_field(name="Players", value=chunk, inline=False)
+        embed.set_footer(text=f"Total: {len(members)}")
+        return embed
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(DailyTasks(bot))

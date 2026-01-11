@@ -5,5 +5,12 @@
         "economy": ,
         "fight": ,
         "citizen": 
+    },
+    "military_units": [
+        { "id" : "", "roleId": },
+        { "id" : "", "roleId": }
+    ],
+    "channels" : {
+        "reports" : 
     }
 }
