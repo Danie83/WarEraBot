@@ -1,24 +1,31 @@
 import aiohttp
 import discord
 from discord.ext import commands, tasks
-from utils.api import get_user
+from utils.api import get_user, get_all_countries, get_country_government
 from utils.computational import triangular
 from config import config
 
 ECONOMY_SKILLS = ['energy', 'companies', 'entrepreneurship', 'production']
 
-class DailyTasks(commands.Cog):
+class Jobs(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.cached_members = {}
+        self.countries = None
         self.skill_roles.start()
         self.military_unit_roles.start()
         self.unidentified_members.start()
+        self.takeover_countries.start()
 
     def cog_unload(self):
         self.skill_roles.cancel()
         self.military_unit_roles.cancel()
         self.unidentified_members.cancel()
+        self.takeover_countries.cancel()
+    
+    async def get_countries(self):
+        async with aiohttp.ClientSession() as session:
+            return await get_all_countries(session)
 
     @tasks.loop(hours=24)
     async def skill_roles(self):
@@ -131,6 +138,57 @@ class DailyTasks(commands.Cog):
     @unidentified_members.before_loop
     async def before_unidentified_members(self):
         await self.bot.wait_until_ready()
+
+    @tasks.loop(minutes=1)
+    async def takeover_countries(self):
+        """Parses all countries of the server and posts any country that can be taken over.
+        """
+
+        if self.countries is None:
+            self.countries = await self.get_countries()
+
+        if self.countries is None or len(self.countries) == 0:
+            return
+        
+        guild = self.bot.get_guild(config['guild'])
+        active_countries = config['active_countries']
+        async with aiohttp.ClientSession() as session:
+            empty_countries = []
+            for country in self.countries:
+                if active_countries is not None and len(active_countries) != 0:
+                    if country['name'] in active_countries:
+                        continue
+                government = await get_country_government(country['_id'], session)
+                # country is empty, api displays only _id, country, __v, and congressMembers keys .
+                if len(government.keys()) == 4 and len(government['congressMembers']) == 0:
+                    empty_countries.append((country['name'], country['_id']))
+            if len(empty_countries) == 0:
+                return
+            channel = guild.get_channel(config["channels"]["reports"])
+            embed = self.build_takeover_embed(empty_countries)
+            await channel.send(embed=embed)
+
+    @takeover_countries.before_loop
+    async def before_takeover_countries(self):
+        await self.bot.wait_until_ready()
+
+    def build_takeover_embed(self, countries) -> discord.Embed:
+        embed = discord.Embed(
+            title="Takeover Countries Found",
+            description="The following countries can be captured:",
+            color=discord.Color.orange()
+        )
+        lines = [f"* {c[0]} ('https://app.warera.io/country/{c[1]}')" for c in countries]
+        chunk = ""
+        for line in lines:
+            if len(chunk) + len(line) > 1000:
+                embed.add_field(name="Countries", value=chunk, inline=False)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
+            embed.add_field(name="Countries", value=chunk, inline=False)
+        embed.set_footer(text=f"Total: {len(countries)}")
+        return embed
         
     def build_unidentified_embed(self, members: list[discord.Member]) -> discord.Embed:
         embed = discord.Embed(
@@ -149,6 +207,6 @@ class DailyTasks(commands.Cog):
             embed.add_field(name="Players", value=chunk, inline=False)
         embed.set_footer(text=f"Total: {len(members)}")
         return embed
-
+    
 async def setup(bot: commands.Bot):
-    await bot.add_cog(DailyTasks(bot))
+    await bot.add_cog(Jobs(bot))

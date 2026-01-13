@@ -10,7 +10,7 @@ class WarEraBot(commands.Bot):
         super().__init__(command_prefix='!', intents=intents)
 
     async def setup_hook(self):
-        await self.load_extension("cogs.tasks.daily")
+        await self.load_extension("cogs.tasks.jobs")
         await self.tree.sync()
 
 bot = WarEraBot()

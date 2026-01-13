@@ -32,3 +32,23 @@ async def get_user_info(userId, session, base_url="https://api2.warera.io/trpc/u
     if not api_result:
         return None
     return api_result
+
+async def get_all_countries(session, base_url="https://api2.warera.io/trpc/country.getAllCountries"):
+    async with session.get(base_url) as response:
+        response.raise_for_status()
+        data = await response.json()
+    api_result = data.get('result', {}).get('data')
+    if not api_result:
+        return None
+    return api_result
+
+async def get_country_government(counrtyId, session, base_url="https://api2.warera.io/trpc/government.getByCountryId"):
+    input_data = { 'countryId': counrtyId}
+    params = { "input" : json.dumps(input_data)}
+    async with session.get(base_url, params=params) as response:
+        response.raise_for_status()
+        data = await response.json()
+    api_result = data.get('result', {}).get('data')
+    if not api_result:
+        return None
+    return api_result
