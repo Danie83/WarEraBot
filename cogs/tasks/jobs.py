@@ -1,17 +1,24 @@
 import aiohttp
 import discord
 from discord.ext import commands, tasks
-from utils.api import get_user, get_all_countries, get_country_government
+from utils.api import get_user, get_all_countries, get_country_government, get_user_info
+from utils.db import init_db, save_user, find_api_id_by_display_name, find_api_id_by_discord_username
 from utils.computational import triangular
 from config import config
 
 ECONOMY_SKILLS = ['energy', 'companies', 'entrepreneurship', 'production']
+HEADERS = {'X-API-Key': config['api']}
 
 class Jobs(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.cached_members = {}
         self.countries = None
+        # Ensure database/table exists
+        try:
+            init_db()
+        except Exception:
+            pass
         self.skill_roles.start()
         self.military_unit_roles.start()
         self.unidentified_members.start()
@@ -24,7 +31,7 @@ class Jobs(commands.Cog):
         self.takeover_countries.cancel()
     
     async def get_countries(self):
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
             return await get_all_countries(session)
 
     @tasks.loop(hours=24)
@@ -33,12 +40,20 @@ class Jobs(commands.Cog):
            roles based on their assigned skills (economy or fighter)
         """
         guild = self.bot.get_guild(config['guild'])
+        if guild is None:
+            return
         citizen = guild.get_role(config['roles']['citizen'])
         economy_role = guild.get_role(config['roles']['economy'])
         fight_role = guild.get_role(config['roles']['fight'])
         
-        members = citizen.members
-        async with aiohttp.ClientSession() as session:
+        members = citizen.members if citizen else []
+        stats = {
+            'economy_added': 0,
+            'economy_removed': 0,
+            'fight_added': 0,
+            'fight_removed': 0,
+        }
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
             for member in members:
                 user = await get_user(member.display_name, session)
                 if user is None:
@@ -66,17 +81,27 @@ class Jobs(commands.Cog):
                     continue
 
                 if is_economy:
-                    if economy_role not in member.roles:
+                    if economy_role and economy_role not in member.roles:
                         await member.add_roles(economy_role, reason="Economy skill > 50")
-                    if fight_role in member.roles:
+                        stats['economy_added'] += 1
+                    if fight_role and fight_role in member.roles:
                         await member.remove_roles(fight_role, reason="Economy > 50, remove fighter role")
+                        stats['fight_removed'] += 1
                 else:
-                    if fight_role not in member.roles:
+                    if fight_role and fight_role not in member.roles:
                         await member.add_roles(fight_role, reason="Economy skill <= 50")
-                    if economy_role in member.roles:
+                        stats['fight_added'] += 1
+                    if economy_role and economy_role in member.roles:
                         await member.remove_roles(economy_role, reason="Economy <= 50, remove economy role")
+                        stats['economy_removed'] += 1
                 
                 self.cached_members[member.id] = is_economy
+
+        # Send a summary embed for the run (even if no changes)
+        channel = guild.get_channel(config["channels"]["reports"]) if guild else None
+        if channel:
+            embed = self.build_skill_roles_embed(stats)
+            await channel.send(embed=embed)
 
     @skill_roles.before_loop
     async def before_skill_roles(self):
@@ -88,12 +113,16 @@ class Jobs(commands.Cog):
            military unit roles based on the available MU server roles available.
         """
         guild = self.bot.get_guild(config['guild'])
+        if guild is None:
+            return
         citizen = guild.get_role(config['roles']['citizen'])
-        military_units = config['military_units']
+        military_units = config.get('military_units', [])
         mu_to_role = {unit['id'] : guild.get_role(unit['roleId']) for unit in military_units}
 
-        members = citizen.members
-        async with aiohttp.ClientSession() as session:
+        members = citizen.members if citizen else []
+        added_counts: dict = {}
+        removed_counts: dict = {}
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
             for member in members:
                 user = await get_user(member.display_name, session)
                 if user is None or "mu" not in user.keys():
@@ -108,8 +137,19 @@ class Jobs(commands.Cog):
                     if r and r in member.roles and r != role
                 ]
                 await member.add_roles(role, reason="Assigned Military Unit role.")
+                name = role.name if role else str(role.id)
+                added_counts[name] = added_counts.get(name, 0) + 1
                 if roles_to_remove:
                     await member.remove_roles(*roles_to_remove, reason="Removed unused Military Unit roles.")
+                    for r in roles_to_remove:
+                        rname = r.name if r else str(r.id)
+                        removed_counts[rname] = removed_counts.get(rname, 0) + 1
+
+        # Send a summary embed for military unit role changes
+        channel = guild.get_channel(config["channels"]["reports"]) if guild else None
+        if channel:
+            embed = self.build_military_unit_embed(added_counts, removed_counts)
+            await channel.send(embed=embed)
 
     @military_unit_roles.before_loop
     async def before_military_unit_roles(self):
@@ -123,56 +163,79 @@ class Jobs(commands.Cog):
         guild = self.bot.get_guild(config['guild'])
         citizen = guild.get_role(config['roles']['citizen'])
         unidentified = []
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
             for member in citizen.members:
                 user = await get_user(member.display_name, session)
                 if user is None:
+                    # try to find api_id in local DB by display name or discord username
+                    try:
+                        api_id = find_api_id_by_display_name(member.display_name) or find_api_id_by_discord_username(member.name)
+                        if api_id:
+                            info = await get_user_info(api_id, session)
+                            if info:
+                                # update stored mapping with the current display name
+                                save_user(member.name, member.display_name, api_id)
+                                continue
+                    except Exception:
+                        pass
                     unidentified.append(member)
-                    continue
-            if len(unidentified) == 0:
-                return
-            channel = guild.get_channel(config["channels"]["reports"])
-            embed = self.build_unidentified_embed(unidentified)
-            await channel.send(embed=embed)
+                else:
+                    try:
+                        api_id = user.get('_id') if isinstance(user, dict) else None
+                        if api_id:
+                            save_user(member.name, member.display_name, api_id)
+                    except Exception:
+                        pass
+            # Always send an embed, even if there are no unidentified players
+            channel = guild.get_channel(config["channels"]["reports"]) if guild else None
+            if channel:
+                embed = self.build_unidentified_embed(unidentified)
+                await channel.send(embed=embed)
 
     @unidentified_members.before_loop
     async def before_unidentified_members(self):
         await self.bot.wait_until_ready()
 
-    @tasks.loop(minutes=1)
+    @tasks.loop(minutes=5)
     async def takeover_countries(self):
         """Parses all countries of the server and posts any country that can be taken over.
         """
-
         if self.countries is None:
             self.countries = await self.get_countries()
 
-        if self.countries is None or len(self.countries) == 0:
-            return
-        
         guild = self.bot.get_guild(config['guild'])
-        active_countries = config['active_countries']
-        async with aiohttp.ClientSession() as session:
+        active_countries = config.get('active_countries', [])
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
             empty_countries = []
-            for country in self.countries:
+            countries_list = self.countries or []
+            for country in countries_list:
                 if active_countries is not None and len(active_countries) != 0:
                     if country['name'] in active_countries:
                         continue
                 government = await get_country_government(country['_id'], session)
                 # country is empty, api displays only _id, country, __v, and congressMembers keys .
-                if len(government.keys()) == 4 and len(government['congressMembers']) == 0:
+                if government is not None and len(government.keys()) == 4 and len(government['congressMembers']) == 0:
                     empty_countries.append((country['name'], country['_id']))
-            if len(empty_countries) == 0:
-                return
-            channel = guild.get_channel(config["channels"]["reports"])
-            embed = self.build_takeover_embed(empty_countries)
-            await channel.send(embed=embed)
+            # Always send an embed reporting the results (may be empty)
+            channel = guild.get_channel(config["channels"]["reports"]) if guild else None
+            if channel:
+                embed = self.build_takeover_embed(empty_countries)
+                await channel.send(embed=embed)
 
     @takeover_countries.before_loop
     async def before_takeover_countries(self):
         await self.bot.wait_until_ready()
 
     def build_takeover_embed(self, countries) -> discord.Embed:
+        if not countries:
+            embed = discord.Embed(
+                title="Takeover Countries Check",
+                description="No takeover countries were found.",
+                color=discord.Color.green()
+            )
+            embed.set_footer(text="Total: 0")
+            return embed
+
         embed = discord.Embed(
             title="Takeover Countries Found",
             description="The following countries can be captured:",
@@ -191,6 +254,15 @@ class Jobs(commands.Cog):
         return embed
         
     def build_unidentified_embed(self, members: list[discord.Member]) -> discord.Embed:
+        if not members:
+            embed = discord.Embed(
+                title="Unidentified Players Check",
+                description="No unidentified players were found.",
+                color=discord.Color.green()
+            )
+            embed.set_footer(text="Total: 0")
+            return embed
+
         embed = discord.Embed(
             title="Unidentified Players Found",
             description="The following members could not be matched:",
@@ -206,6 +278,59 @@ class Jobs(commands.Cog):
         if chunk:
             embed.add_field(name="Players", value=chunk, inline=False)
         embed.set_footer(text=f"Total: {len(members)}")
+        return embed
+    
+    def build_skill_roles_embed(self, stats: dict) -> discord.Embed:
+        economy_added = stats.get('economy_added', 0)
+        economy_removed = stats.get('economy_removed', 0)
+        fight_added = stats.get('fight_added', 0)
+        fight_removed = stats.get('fight_removed', 0)
+        total = economy_added + economy_removed + fight_added + fight_removed
+
+        if total == 0:
+            embed = discord.Embed(
+                title="Skill Roles Check",
+                description="No skill role changes were detected.",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Economy Roles", value=f"Added: {economy_added}\nRemoved: {economy_removed}", inline=True)
+            embed.add_field(name="Fight Roles", value=f"Added: {fight_added}\nRemoved: {fight_removed}", inline=True)
+            embed.set_footer(text="Total changes: 0")
+            return embed
+
+        embed = discord.Embed(
+            title="Skill Roles Updated",
+            description="Summary of skill role changes:",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Economy Roles", value=f"Added: {economy_added}\nRemoved: {economy_removed}", inline=True)
+        embed.add_field(name="Fight Roles", value=f"Added: {fight_added}\nRemoved: {fight_removed}", inline=True)
+        embed.set_footer(text=f"Total changes: {total}")
+        return embed
+
+    def build_military_unit_embed(self, added: dict, removed: dict) -> discord.Embed:
+        all_roles = set(list(added.keys()) + list(removed.keys()))
+        total = sum(added.values()) + sum(removed.values())
+
+        if total == 0:
+            embed = discord.Embed(
+                title="Military Unit Roles Check",
+                description="No military unit role changes were detected.",
+                color=discord.Color.green()
+            )
+            embed.set_footer(text="Total changes: 0")
+            return embed
+
+        embed = discord.Embed(
+            title="Military Unit Roles Updated",
+            description="Summary of military unit role changes:",
+            color=discord.Color.orange()
+        )
+        for role_name in sorted(all_roles):
+            a = added.get(role_name, 0)
+            r = removed.get(role_name, 0)
+            embed.add_field(name=role_name, value=f"Added: {a}\nRemoved: {r}", inline=False)
+        embed.set_footer(text=f"Total changes: {total}")
         return embed
     
 async def setup(bot: commands.Bot):
