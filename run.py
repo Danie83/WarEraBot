@@ -26,4 +26,8 @@ bot = WarEraBot()
 async def on_ready():
     print(f"Logged in as {bot.user}")
 
-bot.run(config['token'])
+token = config["token"]
+if not token:
+    raise RuntimeError("Missing DISCORD_TOKEN environment variable.")
+
+bot.run(token)
