@@ -168,11 +168,10 @@ async def get_fight_status(userId: str, session, member: discord.Member | None =
                     remaining = buff_dt - now
                     buff_active = remaining.total_seconds() > 0
                     if buff_active:
-                        days = remaining.days
                         hours = remaining.seconds // 3600
                         minutes = (remaining.seconds % 3600) // 60
                         # Provide relative time only (e.g. "Buff ends in 1d 2h 3m")
-                        buff_text = f"{buff_type} ends in {days}d {hours}h {minutes}m"
+                        buff_text = f"{buff_type} ends in {hours}h {minutes}m"
                     else:
                         buff_text = f"{buff_type} expired"
                 except Exception:
@@ -209,5 +208,46 @@ async def get_fight_status(userId: str, session, member: discord.Member | None =
             'buff_end_at': buff_end_at,
             'buff_active': bool(buff_active),
         }
+    except Exception:
+        return None
+
+async def request_military_units(input_data, session, base_url="https://api2.warera.io/trpc/mu.getManyPaginated"):
+    try:
+        params = {"input": json.dumps(input_data)}
+        data = await _get_with_retry(session, base_url, params=params)
+        if not data:
+            return None
+        return data
+    except Exception:
+        return None
+async def get_military_units(session, base_url="https://api2.warera.io/trpc/mu.getManyPaginated"):
+    """Return a flat list of military unit items from the paginated mu.getManyPaginated endpoint.
+
+    Returns list[dict] or None on failure. Each item is expected to contain at least a `name` key
+    and optionally a `members` list.
+    """
+    try:
+        input_data = {"limit": 100}
+        params = {"input": json.dumps(input_data)}
+        mus = await _get_with_retry(session, base_url, params=params)
+        if not mus:
+            return None
+
+        data = mus.get('result', {}).get('data') or {}
+        items = data.get('items') or []
+        next_cursor = data.get('nextCursor')
+
+        while next_cursor:
+            input_data['cursor'] = next_cursor
+            params = {"input": json.dumps(input_data)}
+            mus = await _get_with_retry(session, base_url, params=params)
+            if not mus:
+                break
+            data = mus.get('result', {}).get('data') or {}
+            new_items = data.get('items') or []
+            items += new_items
+            next_cursor = data.get('nextCursor')
+
+        return items
     except Exception:
         return None

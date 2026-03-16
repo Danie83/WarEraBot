@@ -8,11 +8,24 @@ from config import config
 
 ECONOMY_SKILLS = ['energy', 'companies', 'entrepreneurship', 'production']
 HEADERS = {'X-API-Key': config['api']}
+from datetime import datetime, timezone, timedelta
+
+# minutes before buff end to notify the user
+NOTIFY_THRESHOLD_MINUTES = 30
+# how long to wait before re-checking users with no active buff/debuff
+DEFAULT_SKIP_HOURS = 1
+# how often the buff monitor runs (minutes) — keep in sync with @tasks.loop(minutes=...)
+BUFF_MONITOR_INTERVAL_MINUTES = 10
+# effective notify threshold to account for the monitor interval so users are
+# guaranteed to be notified at least NOTIFY_THRESHOLD_MINUTES before expiry
+EFFECTIVE_NOTIFY_MINUTES = NOTIFY_THRESHOLD_MINUTES
 
 class Jobs(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.cached_members = {}
+        # cache for buff checks: api_id -> { next_check: datetime, notified_for_end_at: str|None }
+        self.buff_check_cache: dict = {}
         self.countries = None
         # Ensure database/table exists
         try:
@@ -23,13 +36,14 @@ class Jobs(commands.Cog):
         self.military_unit_roles.start()
         self.unidentified_members.start()
         self.takeover_countries.start()
+        self.buff_monitor.start()
 
     def cog_unload(self):
         self.skill_roles.cancel()
         self.military_unit_roles.cancel()
         self.unidentified_members.cancel()
         self.takeover_countries.cancel()
-    
+        self.buff_monitor.cancel()
     async def get_countries(self):
         async with aiohttp.ClientSession(headers=HEADERS) as session:
             return await get_all_countries(session)
@@ -217,6 +231,8 @@ class Jobs(commands.Cog):
                 if government is not None and len(government.keys()) == 4 and len(government['congressMembers']) == 0:
                     empty_countries.append((country['name'], country['_id']))
             # Always send an embed reporting the results (may be empty)
+            if len(empty_countries) == 0:
+                return
             channel = guild.get_channel(config["channels"]["reports"]) if guild else None
             if channel:
                 embed = self.build_takeover_embed(empty_countries)
@@ -225,6 +241,148 @@ class Jobs(commands.Cog):
     @takeover_countries.before_loop
     async def before_takeover_countries(self):
         await self.bot.wait_until_ready()
+
+    @tasks.loop(minutes=10)
+    async def buff_monitor(self):
+        """Checks fighter members for active buffs and notifies users when their
+        buff is nearing expiration (within NOTIFY_THRESHOLD_MINUTES).
+        The method uses an in-memory cache (`self.buff_check_cache`) to avoid
+        scanning all fighters every run; entries store the earliest `next_check`.
+        """
+        guild = self.bot.get_guild(config['guild'])
+        if guild is None:
+            return
+        fight_role = guild.get_role(config['roles']['fight'])
+        if fight_role is None:
+            return
+
+        now = datetime.now(timezone.utc)
+        members = fight_role.members if fight_role else []
+        seen_api_ids = set()
+
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            for member in members:
+                api_id = None
+                try:
+                    api_id = find_api_id_by_display_name(member.display_name) or find_api_id_by_discord_username(member.name)
+                except Exception:
+                    api_id = None
+
+                # If we already know the next time to check this API id, skip for now
+                if api_id:
+                    entry = self.buff_check_cache.get(api_id)
+                    if entry:
+                        next_check = entry.get('next_check')
+                        if next_check and next_check > now:
+                            seen_api_ids.add(api_id)
+                            continue
+
+                # Retrieve user info. Prefer get_user_info when we already have api_id
+                user_obj = None
+                if api_id:
+                    try:
+                        user_obj = await get_user_info(api_id, session)
+                    except Exception:
+                        user_obj = None
+
+                if not user_obj:
+                    user_obj = await get_user(member.display_name, session)
+                    if isinstance(user_obj, dict):
+                        api_id = user_obj.get('_id') or api_id
+                        if api_id:
+                            try:
+                                save_user(member.name, member.display_name, api_id)
+                            except Exception:
+                                pass
+
+                if not user_obj:
+                    continue
+
+                # Parse buff/debuff information from the user object
+                buffs = user_obj.get('buffs') or {}
+                buff_end_at = None
+                buff_type = None
+                buff_active = False
+                if isinstance(buffs, dict) and buffs:
+                    if 'debuffEndAt' in buffs and buffs.get('debuffEndAt'):
+                        buff_end_at = buffs.get('debuffEndAt')
+                        buff_type = 'Debuff'
+                    elif 'buffEndAt' in buffs and buffs.get('buffEndAt'):
+                        buff_end_at = buffs.get('buffEndAt')
+                        buff_type = 'Buff'
+
+                    if buff_end_at:
+                        try:
+                            buff_dt = datetime.fromisoformat(buff_end_at.replace('Z', '+00:00'))
+                            remaining = buff_dt - now
+                            buff_active = remaining.total_seconds() > 0
+                        except Exception:
+                            buff_active = False
+
+                cache_entry = self.buff_check_cache.get(api_id, {})
+
+                # No active buff/debuff
+                if not buff_end_at or not buff_active:
+                    cache_entry['next_check'] = now + timedelta(hours=DEFAULT_SKIP_HOURS)
+                    cache_entry['notified_for_end_at'] = None
+                    self.buff_check_cache[api_id] = cache_entry
+                    seen_api_ids.add(api_id)
+                    continue
+
+                # Currently on debuff -> avoid until debuff ends
+                if buff_type == 'Debuff':
+                    cache_entry['next_check'] = buff_dt + timedelta(minutes=1)
+                    cache_entry['notified_for_end_at'] = None
+                    self.buff_check_cache[api_id] = cache_entry
+                    seen_api_ids.add(api_id)
+                    continue
+
+                # Active buff: notify when within effective threshold (accounts for poll delay)
+                remaining_seconds = (buff_dt - now).total_seconds()
+                notified_token = cache_entry.get('notified_for_end_at')
+                if remaining_seconds <= EFFECTIVE_NOTIFY_MINUTES * 60:
+                    if notified_token != buff_end_at:
+                        minutes = max(1, int(remaining_seconds // 60))
+                        text = f"Hi {member.display_name}, your pill buff expires in about {minutes} minute{'s' if minutes != 1 else ''}. Please empty into a fight if possible."
+                        try:
+                            await member.send(text)
+                        except Exception:
+                            channel = guild.get_channel(config.get('channels', {}).get('reports')) if guild else None
+                            if channel:
+                                try:
+                                    await channel.send(f"{member.mention} — {text}")
+                                except Exception:
+                                    pass
+                        cache_entry['notified_for_end_at'] = buff_end_at
+                        cache_entry['next_check'] = buff_dt + timedelta(minutes=1)
+                    else:
+                        cache_entry['next_check'] = buff_dt + timedelta(minutes=1)
+                    self.buff_check_cache[api_id] = cache_entry
+                    seen_api_ids.add(api_id)
+                    continue
+
+                # Schedule next check at buff_dt - (effective threshold)
+                next_check = buff_dt - timedelta(minutes=EFFECTIVE_NOTIFY_MINUTES)
+                if next_check <= now:
+                    next_check = now + timedelta(minutes=BUFF_MONITOR_INTERVAL_MINUTES)
+                cache_entry['next_check'] = next_check
+                cache_entry['notified_for_end_at'] = cache_entry.get('notified_for_end_at')
+                self.buff_check_cache[api_id] = cache_entry
+                seen_api_ids.add(api_id)
+
+        # Prune cache entries for API ids we did not see during this run
+        to_prune = [k for k in list(self.buff_check_cache.keys()) if k not in seen_api_ids]
+        for k in to_prune:
+            try:
+                entry = self.buff_check_cache.get(k)
+                if not entry:
+                    del self.buff_check_cache[k]
+                    continue
+                next_check = entry.get('next_check')
+                if not next_check or (isinstance(next_check, datetime) and next_check < datetime.now(timezone.utc) - timedelta(hours=24)):
+                    del self.buff_check_cache[k]
+            except Exception:
+                pass
 
     def build_takeover_embed(self, countries) -> discord.Embed:
         if not countries:

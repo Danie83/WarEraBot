@@ -1,8 +1,10 @@
 import aiohttp
+import asyncio
+import time
 import discord
 from discord import app_commands
 from discord.ext import commands
-from utils.api import get_user, get_fight_status
+from utils.api import get_user, get_fight_status, get_military_units
 from config import config
 
 HEADERS = {'X-API-Key': config['api']}
@@ -10,66 +12,144 @@ HEADERS = {'X-API-Key': config['api']}
 class FightStatus(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # military units cache: {'items': [...], 'fetched_at': timestamp}
+        self._mu_cache: dict = {'items': [], 'fetched_at': 0.0}
+        self._mu_ttl: float = 300.0
+        self._mu_refresh_task: asyncio.Task | None = None
 
-    @app_commands.command(name="fightstatus", description="Fetch fight status for all members with the fight role and paginate results.")
-    async def fightstatus(self, interaction: discord.Interaction):
-        """Fetch fight status for all members with the fight role and paginate results."""
+    async def _resolve_guild_and_role(self, interaction: discord.Interaction):
         guild = interaction.guild or self.bot.get_guild(config['guild'])
         if guild is None:
-            await interaction.response.send_message("Guild not found.")
-            return
-
+            return None, "Guild not found."
         fight_role = guild.get_role(config['roles']['fight'])
         if fight_role is None:
-            await interaction.response.send_message("Fight role not configured.")
-            return
+            return None, "Fight role not configured."
+        return fight_role, None
 
-        members = fight_role.members
-        if not members:
-            await interaction.response.send_message("No fighters found.")
-            return
+    async def _fallback_info_for_member(self, member: discord.Member) -> dict:
+        return {
+            'userId': str(member.id),
+            'warera_name': None,
+            'display_name': member.display_name,
+            'avatar_url': None,
+            'level': 'N/A',
+            'is_active': False,
+            'health_curr': None,
+            'health_total': None,
+            'hunger_curr': None,
+            'hunger_total': None,
+            'buff_text': '',
+            'buff_type': None,
+            'buff_end_at': None,
+            'buff_active': False,
+        }
 
-        # defer because we will likely make network requests
+    async def _fallback_info_for_remote(self, user_id: str, source: dict | None = None) -> dict:
+        return {
+            'userId': str(user_id),
+            'warera_name': (source or {}).get('name') if source is not None else None,
+            'display_name': None,
+            'avatar_url': None,
+            'level': 'N/A',
+            'is_active': False,
+            'health_curr': None,
+            'health_total': None,
+            'hunger_curr': None,
+            'hunger_total': None,
+            'buff_text': '',
+            'buff_type': None,
+            'buff_end_at': None,
+            'buff_active': False,
+        }
+
+    async def _fetch_infos_for_discord_members(self, members: list[discord.Member], session) -> list[dict]:
+        infos: list[dict] = []
+        for member in members:
+            warera_user = None
+            try:
+                warera_user = await get_user(member.display_name, session)
+            except Exception:
+                warera_user = None
+
+            info = None
+            if warera_user:
+                warera_id = warera_user.get('_id') or warera_user.get('id')
+                if warera_id:
+                    try:
+                        info = await get_fight_status(str(warera_id), session, member)
+                    except Exception:
+                        info = None
+
+            if not info:
+                info = await self._fallback_info_for_member(member)
+            infos.append(info)
+        return infos
+
+    async def _fetch_infos_for_military_unit(self, unit_name: str, session) -> list[dict] | None:
+        mus = await get_military_units(session)
+        if not mus:
+            return None
+
+        # try exact match first, then substring
+        chosen = None
+        for mu in mus:
+            if (mu.get('name') or '').strip().lower() == unit_name.strip().lower():
+                chosen = mu
+                break
+        if chosen is None:
+            for mu in mus:
+                if unit_name.strip().lower() in (mu.get('name') or '').strip().lower():
+                    chosen = mu
+                    break
+
+        if not chosen:
+            return []
+
+        members = chosen.get('members') or []
+        infos: list[dict] = []
+        for m in members:
+            user_id = m
+
+            if not user_id:
+                continue
+
+            try:
+                info = await get_fight_status(str(user_id), session, None)
+            except Exception:
+                info = None
+
+            if not info:
+                info = await self._fallback_info_for_remote(str(user_id), m if isinstance(m, dict) else None)
+
+            infos.append(info)
+
+        return infos
+
+    @app_commands.command(name="fightstatus", description="Fetch fight status for fighters or a military unit and paginate results.")
+    @app_commands.describe(military_unit="Military unit name (optional). If provided, shows members from that unit instead of guild role.")
+    async def fightstatus(self, interaction: discord.Interaction, military_unit: str | None = None):
+        """Fetch fight status for guild-role members or for a specific military unit."""
+        # If no military unit is provided, operate on the guild fight role members
+        if military_unit is None:
+            fight_role, err = await self._resolve_guild_and_role(interaction)
+            if err:
+                await interaction.response.send_message(err)
+                return
+
+            members = fight_role.members
+            if not members:
+                await interaction.response.send_message("No fighters found.")
+                return
+
+        # defer early because we'll perform network I/O
         await interaction.response.defer()
 
         infos: list[dict] = []
         async with aiohttp.ClientSession(headers=HEADERS) as session:
-            for member in members:
-                # attempt to resolve WarEra user and fetch info; always include a fallback
-                warera_user = None
-                try:
-                    warera_user = await get_user(member.display_name, session)
-                except Exception:
-                    warera_user = None
-
-                info = None
-                if warera_user:
-                    warera_id = warera_user.get('_id') or warera_user.get('id')
-                    if warera_id:
-                        try:
-                            info = await get_fight_status(str(warera_id), session, member)
-                        except Exception:
-                            info = None
-
-                # if we couldn't fetch WarEra data, use Discord fallback so every fighter appears
-                if not info:
-                    info = {
-                        'userId': str(member.id),
-                        'warera_name': None,
-                        'display_name': member.display_name,
-                        'avatar_url': None,
-                        'level': 'N/A',
-                        'is_active': False,
-                        'health_curr': None,
-                        'health_total': None,
-                        'hunger_curr': None,
-                        'hunger_total': None,
-                        'buff_text': '',
-                        'buff_type': None,
-                        'buff_end_at': None,
-                        'buff_active': False,
-                    }
-                infos.append(info)
+            if military_unit is None:
+                infos = await self._fetch_infos_for_discord_members(members, session)
+            else:
+                infos = await self._fetch_infos_for_military_unit(military_unit, session)
 
         if not infos:
             await interaction.followup.send("No fighter information available.")
@@ -92,6 +172,47 @@ class FightStatus(commands.Cog):
 
         paginator = self.FightEmbedPaginator(infos, interaction.user, per_page=10)
         await paginator.start(interaction)
+
+    @fightstatus.autocomplete('military_unit')
+    async def military_unit_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        # Provide up to 25 matching military unit names using an in-memory TTL cache
+        # Return cached results immediately and refresh in background when needed.
+        now = time.time()
+        items = self._mu_cache.get('items') or []
+        fetched = self._mu_cache.get('fetched_at') or 0.0
+
+        # If cache expired and no refresh task running, start a background refresh
+        if now - fetched > self._mu_ttl:
+            if not self._mu_refresh_task or self._mu_refresh_task.done():
+                async def _refresh():
+                    try:
+                        async with aiohttp.ClientSession(headers=HEADERS) as session:
+                            new_items = await get_military_units(session)
+                        if new_items:
+                            self._mu_cache['items'] = new_items
+                            self._mu_cache['fetched_at'] = time.time()
+                    except Exception:
+                        return
+
+                # schedule background refresh without awaiting
+                try:
+                    self._mu_refresh_task = asyncio.create_task(_refresh())
+                except RuntimeError:
+                    # event loop not running; ignore
+                    self._mu_refresh_task = None
+
+        # Filter cached items quickly
+        lower = (current or "").strip().lower()
+        choices: list[app_commands.Choice[str]] = []
+        for mu in items:
+            name = mu.get('name')
+            if not name:
+                continue
+            if not lower or lower in name.lower():
+                choices.append(app_commands.Choice(name=name, value=name))
+            if len(choices) >= 25:
+                break
+        return choices
 
     class FightEmbedPaginator(discord.ui.View):
         def __init__(self, infos: list[dict], author, per_page: int = 10, timeout: float = 120.0):
