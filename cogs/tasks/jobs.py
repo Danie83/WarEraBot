@@ -62,10 +62,10 @@ class Jobs(commands.Cog):
         
         members = citizen.members if citizen else []
         stats = {
-            'economy_added': 0,
-            'economy_removed': 0,
-            'fight_added': 0,
-            'fight_removed': 0,
+            'economy_added': [],
+            'economy_removed': [],
+            'fight_added': [],
+            'fight_removed': [],
         }
         async with aiohttp.ClientSession(headers=HEADERS) as session:
             for member in members:
@@ -97,31 +97,34 @@ class Jobs(commands.Cog):
                 if is_economy:
                     if economy_role and economy_role not in member.roles:
                         await member.add_roles(economy_role, reason="Economy skill > 50")
-                        stats['economy_added'] += 1
+                        stats['economy_added'].append(member.display_name)
                     if fight_role and fight_role in member.roles:
                         await member.remove_roles(fight_role, reason="Economy > 50, remove fighter role")
-                        stats['fight_removed'] += 1
+                        stats['fight_removed'].append(member.display_name)
                 else:
                     if fight_role and fight_role not in member.roles:
                         await member.add_roles(fight_role, reason="Economy skill <= 50")
-                        stats['fight_added'] += 1
+                        stats['fight_added'].append(member.display_name)
                     if economy_role and economy_role in member.roles:
                         await member.remove_roles(economy_role, reason="Economy <= 50, remove economy role")
-                        stats['economy_removed'] += 1
+                        stats['economy_removed'].append(member.display_name)
                 
                 self.cached_members[member.id] = is_economy
 
-        # Send a summary embed for the run (even if no changes)
+        # Send a summary embed for the run only if there were changes
         channel = guild.get_channel(config["channels"]["reports"]) if guild else None
         if channel:
-            embed = self.build_skill_roles_embed(stats)
-            await channel.send(embed=embed)
+            total_changes = sum(len(stats.get(k, [])) for k in ('economy_added', 'economy_removed', 'fight_added', 'fight_removed'))
+            if total_changes > 0:
+                embed = self.build_skill_roles_embed(stats)
+                if embed:
+                    await channel.send(embed=embed)
 
     @skill_roles.before_loop
     async def before_skill_roles(self):
         await self.bot.wait_until_ready()
 
-    @tasks.loop(hours=24)
+    @tasks.loop(hours=3)
     async def military_unit_roles(self):
         """Parses all members of the server that hold the citizen role and assigns
            military unit roles based on the available MU server roles available.
@@ -134,8 +137,9 @@ class Jobs(commands.Cog):
         mu_to_role = {unit['id'] : guild.get_role(unit['roleId']) for unit in military_units}
 
         members = citizen.members if citizen else []
-        added_counts: dict = {}
-        removed_counts: dict = {}
+        # track player display names added/removed per role
+        added_members: dict = {}
+        removed_members: dict = {}
         async with aiohttp.ClientSession(headers=HEADERS) as session:
             for member in members:
                 user = await get_user(member.display_name, session)
@@ -152,24 +156,28 @@ class Jobs(commands.Cog):
                 ]
                 await member.add_roles(role, reason="Assigned Military Unit role.")
                 name = role.name if role else str(role.id)
-                added_counts[name] = added_counts.get(name, 0) + 1
+                added_members.setdefault(name, []).append(member.display_name)
                 if roles_to_remove:
                     await member.remove_roles(*roles_to_remove, reason="Removed unused Military Unit roles.")
                     for r in roles_to_remove:
                         rname = r.name if r else str(r.id)
-                        removed_counts[rname] = removed_counts.get(rname, 0) + 1
+                        removed_members.setdefault(rname, []).append(member.display_name)
 
-        # Send a summary embed for military unit role changes
+        # Send a summary embed for military unit role changes — only if there were changes
         channel = guild.get_channel(config["channels"]["reports"]) if guild else None
         if channel:
-            embed = self.build_military_unit_embed(added_counts, removed_counts)
-            await channel.send(embed=embed)
+            total_changes = sum(len(v) for v in added_members.values()) + sum(len(v) for v in removed_members.values())
+            if total_changes == 0:
+                return
+            embed = self.build_military_unit_embed(added_members, removed_members)
+            if embed:
+                await channel.send(embed=embed)
 
     @military_unit_roles.before_loop
     async def before_military_unit_roles(self):
         await self.bot.wait_until_ready()
 
-    @tasks.loop(hours=24)
+    @tasks.loop(hours=1)
     async def unidentified_members(self):
         """Parses all members of the server that hold the citizen role and checks
            if their server nickname matches the one from the game.
@@ -200,6 +208,8 @@ class Jobs(commands.Cog):
                             save_user(member.name, member.display_name, api_id)
                     except Exception:
                         pass
+            if len(unidentified) == 0:
+                return None
             # Always send an embed, even if there are no unidentified players
             channel = guild.get_channel(config["channels"]["reports"]) if guild else None
             if channel:
@@ -466,55 +476,87 @@ class Jobs(commands.Cog):
         return embed
     
     def build_skill_roles_embed(self, stats: dict) -> discord.Embed:
-        economy_added = stats.get('economy_added', 0)
-        economy_removed = stats.get('economy_removed', 0)
-        fight_added = stats.get('fight_added', 0)
-        fight_removed = stats.get('fight_removed', 0)
-        total = economy_added + economy_removed + fight_added + fight_removed
+        economy_added = stats.get('economy_added', [])
+        economy_removed = stats.get('economy_removed', [])
+        fight_added = stats.get('fight_added', [])
+        fight_removed = stats.get('fight_removed', [])
+        total = len(economy_added) + len(economy_removed) + len(fight_added) + len(fight_removed)
 
+        # If there are no changes, return None so callers can skip sending an embed
         if total == 0:
-            embed = discord.Embed(
-                title="Skill Roles Check",
-                description="No skill role changes were detected.",
-                color=discord.Color.green()
-            )
-            embed.add_field(name="Economy Roles", value=f"Added: {economy_added}\nRemoved: {economy_removed}", inline=True)
-            embed.add_field(name="Fight Roles", value=f"Added: {fight_added}\nRemoved: {fight_removed}", inline=True)
-            embed.set_footer(text="Total changes: 0")
-            return embed
+            return None
 
         embed = discord.Embed(
             title="Skill Roles Updated",
             description="Summary of skill role changes:",
             color=discord.Color.orange()
         )
-        embed.add_field(name="Economy Roles", value=f"Added: {economy_added}\nRemoved: {economy_removed}", inline=True)
-        embed.add_field(name="Fight Roles", value=f"Added: {fight_added}\nRemoved: {fight_removed}", inline=True)
+
+        def format_list(lst: list) -> str:
+            if not lst:
+                return "None"
+            lines = [f"* {n}" for n in lst]
+            cur = ""
+            count = 0
+            for line in lines:
+                if len(cur) + len(line) + 1 > 1000:
+                    break
+                cur += line + "\n"
+                count += 1
+            remaining = len(lines) - count
+            if remaining > 0:
+                cur = cur.rstrip("\n")
+                cur += f"\n... and {remaining} more"
+            return cur
+
+        embed.add_field(name="Economy Roles — Added", value=format_list(economy_added), inline=False)
+        embed.add_field(name="Economy Roles — Removed", value=format_list(economy_removed), inline=False)
+        embed.add_field(name="Fight Roles — Added", value=format_list(fight_added), inline=False)
+        embed.add_field(name="Fight Roles — Removed", value=format_list(fight_removed), inline=False)
         embed.set_footer(text=f"Total changes: {total}")
         return embed
 
     def build_military_unit_embed(self, added: dict, removed: dict) -> discord.Embed:
         all_roles = set(list(added.keys()) + list(removed.keys()))
-        total = sum(added.values()) + sum(removed.values())
+        total = sum(len(v) for v in added.values()) + sum(len(v) for v in removed.values())
 
         if total == 0:
-            embed = discord.Embed(
-                title="Military Unit Roles Check",
-                description="No military unit role changes were detected.",
-                color=discord.Color.green()
-            )
-            embed.set_footer(text="Total changes: 0")
-            return embed
+            return None
 
         embed = discord.Embed(
             title="Military Unit Roles Updated",
             description="Summary of military unit role changes:",
             color=discord.Color.orange()
         )
+
+        def format_players(lst: list) -> str:
+            if not lst:
+                return None
+            lines = [f"* {n}" for n in lst]
+            cur = ""
+            count = 0
+            for line in lines:
+                if len(cur) + len(line) + 1 > 1000:
+                    break
+                cur += line + "\n"
+                count += 1
+            remaining = len(lines) - count
+            if remaining > 0:
+                cur = cur.rstrip("\n")
+                cur += f"\n... and {remaining} more"
+            return cur
+
         for role_name in sorted(all_roles):
-            a = added.get(role_name, 0)
-            r = removed.get(role_name, 0)
-            embed.add_field(name=role_name, value=f"Added: {a}\nRemoved: {r}", inline=False)
+            a_list = added.get(role_name, [])
+            r_list = removed.get(role_name, [])
+            a_formatted = format_players(a_list)
+            r_formatted = format_players(r_list)
+            if a_formatted is None and r_formatted is None:
+                continue
+            if a_formatted is not None:
+                embed.add_field(name=role_name, value=f"Added:\n{a_formatted}\n", inline=False)
+            if r_formatted is not None:
+                embed.add_field(name=role_name, value=f"Removed:\n{r_formatted}\n", inline=False)
         embed.set_footer(text=f"Total changes: {total}")
         return embed
     
