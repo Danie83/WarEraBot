@@ -1,10 +1,9 @@
-import aiohttp
 import asyncio
 import time
 import discord
 from discord import app_commands
 from discord.ext import commands
-from utils.api import get_user, get_fight_status, get_military_units
+from utils.api import get_user, get_fight_status, get_military_units, get_shared_session
 from config import config
 
 HEADERS = {'X-API-Key': config['api']}
@@ -145,11 +144,11 @@ class FightStatus(commands.Cog):
         await interaction.response.defer()
 
         infos: list[dict] = []
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
-            if military_unit is None:
-                infos = await self._fetch_infos_for_discord_members(members, session)
-            else:
-                infos = await self._fetch_infos_for_military_unit(military_unit, session)
+        session = await get_shared_session()
+        if military_unit is None:
+            infos = await self._fetch_infos_for_discord_members(members, session)
+        else:
+            infos = await self._fetch_infos_for_military_unit(military_unit, session)
 
         if not infos:
             await interaction.followup.send("No fighter information available.")
@@ -186,8 +185,8 @@ class FightStatus(commands.Cog):
             if not self._mu_refresh_task or self._mu_refresh_task.done():
                 async def _refresh():
                     try:
-                        async with aiohttp.ClientSession(headers=HEADERS) as session:
-                            new_items = await get_military_units(session)
+                        session = await get_shared_session()
+                        new_items = await get_military_units(session)
                         if new_items:
                             self._mu_cache['items'] = new_items
                             self._mu_cache['fetched_at'] = time.time()

@@ -4,10 +4,33 @@ import logging
 from datetime import datetime, timezone
 from aiohttp import ClientError
 import discord
+import aiohttp
+from config import config
 
 PLAYER_CACHE = {}
 
 logger = logging.getLogger(__name__)
+
+# Shared aiohttp session to avoid repeatedly creating/closing sessions which
+# can leak file descriptors / sockets when done frequently.
+_shared_session: aiohttp.ClientSession | None = None
+
+async def get_shared_session() -> aiohttp.ClientSession:
+    """Return a singleton ClientSession, creating it if needed."""
+    global _shared_session
+    if _shared_session is None or getattr(_shared_session, 'closed', False):
+        headers = {'X-API-Key': config.get('api')}
+        _shared_session = aiohttp.ClientSession(headers=headers)
+    return _shared_session
+
+async def close_shared_session() -> None:
+    """Close the shared ClientSession if it exists."""
+    global _shared_session
+    if _shared_session is not None and not getattr(_shared_session, 'closed', False):
+        try:
+            await _shared_session.close()
+        finally:
+            _shared_session = None
 
 
 async def _get_with_retry(session, url, params=None, max_retries=5, initial_backoff=1.0, backoff_factor=2.0, max_backoff=60.0):
@@ -220,6 +243,7 @@ async def request_military_units(input_data, session, base_url="https://api2.war
         return data
     except Exception:
         return None
+
 async def get_military_units(session, base_url="https://api2.warera.io/trpc/mu.getManyPaginated"):
     """Return a flat list of military unit items from the paginated mu.getManyPaginated endpoint.
 
@@ -249,5 +273,46 @@ async def get_military_units(session, base_url="https://api2.warera.io/trpc/mu.g
             next_cursor = data.get('nextCursor')
 
         return items
+    except Exception:
+        return None
+    
+async def get_active_battles(session, base_url="https://api2.warera.io/trpc/battle.getBattles"):
+    try:
+        input_data = {"isActive": True, "limit": 100}
+        params = {"input": json.dumps(input_data)}
+        mus = await _get_with_retry(session, base_url, params=params)
+        if not mus:
+            return None
+
+        data = mus.get('result', {}).get('data') or {}
+        items = data.get('items') or []
+        next_cursor = data.get('nextCursor')
+
+        while next_cursor:
+            input_data['cursor'] = next_cursor
+            params = {"input": json.dumps(input_data)}
+            mus = await _get_with_retry(session, base_url, params=params)
+            if not mus:
+                break
+            data = mus.get('result', {}).get('data') or {}
+            new_items = data.get('items') or []
+            items += new_items
+            next_cursor = data.get('nextCursor')
+
+        return items
+    except Exception:
+        return None
+    
+async def get_country(countryId, session, base_url="https://api2.warera.io/trpc/country.getCountryById"):
+    try:
+        input_data = {'countryId': countryId}
+        params = {"input": json.dumps(input_data)}
+        data = await _get_with_retry(session, base_url, params=params)
+        if not data:
+            return None
+        api_result = data.get('result', {}).get('data')
+        if not api_result:
+            return None
+        return api_result
     except Exception:
         return None

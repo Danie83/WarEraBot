@@ -1,13 +1,12 @@
-import aiohttp
 import discord
+import asyncio
 from discord.ext import commands, tasks
-from utils.api import get_user, get_all_countries, get_country_government, get_user_info
+from utils.api import get_user, get_all_countries, get_country_government, get_user_info, get_shared_session, get_active_battles, get_country
 from utils.db import init_db, save_user, find_api_id_by_display_name, find_api_id_by_discord_username
 from utils.computational import triangular
 from config import config
 
 ECONOMY_SKILLS = ['energy', 'companies', 'entrepreneurship', 'production']
-HEADERS = {'X-API-Key': config['api']}
 from datetime import datetime, timezone, timedelta
 
 # minutes before buff end to notify the user
@@ -16,6 +15,8 @@ NOTIFY_THRESHOLD_MINUTES = 30
 DEFAULT_SKIP_HOURS = 1
 # how often the buff monitor runs (minutes) — keep in sync with @tasks.loop(minutes=...)
 BUFF_MONITOR_INTERVAL_MINUTES = 10
+# how often the bounty monitor runs (minutes)
+BOUNTY_MONITOR_INTERVAL_MINUTES = 1
 # effective notify threshold to account for the monitor interval so users are
 # guaranteed to be notified at least NOTIFY_THRESHOLD_MINUTES before expiry
 EFFECTIVE_NOTIFY_MINUTES = NOTIFY_THRESHOLD_MINUTES
@@ -24,6 +25,9 @@ class Jobs(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.cached_members = {}
+        # track displayed bounties: key -> last seen bountyEffectiveAt
+        # key format: "{battle_id}:{side}" where side is 'attacker' or 'defender'
+        self.displayed_bounties: dict = {}
         # cache for buff checks: api_id -> { next_check: datetime, notified_for_end_at: str|None }
         self.buff_check_cache: dict = {}
         self.countries = None
@@ -37,6 +41,7 @@ class Jobs(commands.Cog):
         self.unidentified_members.start()
         self.takeover_countries.start()
         self.buff_monitor.start()
+        self.bounty_monitor.start()
 
     def cog_unload(self):
         self.skill_roles.cancel()
@@ -44,9 +49,10 @@ class Jobs(commands.Cog):
         self.unidentified_members.cancel()
         self.takeover_countries.cancel()
         self.buff_monitor.cancel()
+        self.bounty_monitor.cancel()
     async def get_countries(self):
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
-            return await get_all_countries(session)
+        session = await get_shared_session()
+        return await get_all_countries(session)
 
     @tasks.loop(hours=1)
     async def skill_roles(self):
@@ -67,8 +73,8 @@ class Jobs(commands.Cog):
             'fight_added': [],
             'fight_removed': [],
         }
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
-            for member in members:
+        session = await get_shared_session()
+        for member in members:
                 user = await get_user(member.display_name, session)
                 if user is None:
                     continue
@@ -146,8 +152,8 @@ class Jobs(commands.Cog):
         # track player display names added/removed per role
         added_members: dict = {}
         removed_members: dict = {}
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
-            for member in members:
+        session = await get_shared_session()
+        for member in members:
                 user = await get_user(member.display_name, session)
                 if user is None or "mu" not in user.keys():
                     continue
@@ -199,36 +205,36 @@ class Jobs(commands.Cog):
             members.update(newbie.members)
 
         unidentified = []
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
-            for member in members:
-                user = await get_user(member.display_name, session)
-                if user is None:
-                    # try to find api_id in local DB by display name or discord username
-                    try:
-                        api_id = find_api_id_by_display_name(member.display_name) or find_api_id_by_discord_username(member.name)
-                        if api_id:
-                            info = await get_user_info(api_id, session)
-                            if info:
-                                # update stored mapping with the current display name
-                                save_user(member.name, member.display_name, api_id)
-                                continue
-                    except Exception:
-                        pass
-                    unidentified.append(member)
-                else:
-                    try:
-                        api_id = user.get('_id') if isinstance(user, dict) else None
-                        if api_id:
+        session = await get_shared_session()
+        for member in members:
+            user = await get_user(member.display_name, session)
+            if user is None:
+                # try to find api_id in local DB by display name or discord username
+                try:
+                    api_id = find_api_id_by_display_name(member.display_name) or find_api_id_by_discord_username(member.name)
+                    if api_id:
+                        info = await get_user_info(api_id, session)
+                        if info:
+                            # update stored mapping with the current display name
                             save_user(member.name, member.display_name, api_id)
-                    except Exception:
-                        pass
-            if len(unidentified) == 0:
-                return None
-            # Always send an embed, even if there are no unidentified players
-            channel = guild.get_channel(config["channels"]["reports"]) if guild else None
-            if channel:
-                embed = self.build_unidentified_embed(unidentified)
-                await channel.send(embed=embed)
+                            continue
+                except Exception:
+                    pass
+                unidentified.append(member)
+            else:
+                try:
+                    api_id = user.get('_id') if isinstance(user, dict) else None
+                    if api_id:
+                        save_user(member.name, member.display_name, api_id)
+                except Exception:
+                    pass
+        if len(unidentified) == 0:
+            return None
+        # Always send an embed, even if there are no unidentified players
+        channel = guild.get_channel(config["channels"]["reports"]) if guild else None
+        if channel:
+            embed = self.build_unidentified_embed(unidentified)
+            await channel.send(embed=embed)
 
     @unidentified_members.before_loop
     async def before_unidentified_members(self):
@@ -243,24 +249,24 @@ class Jobs(commands.Cog):
 
         guild = self.bot.get_guild(config['guild'])
         active_countries = config.get('active_countries', [])
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
-            empty_countries = []
-            countries_list = self.countries or []
-            for country in countries_list:
-                if active_countries is not None and len(active_countries) != 0:
-                    if country['name'] in active_countries:
-                        continue
-                government = await get_country_government(country['_id'], session)
-                # country is empty, api displays only _id, country, __v, and congressMembers keys .
-                if government is not None and len(government.keys()) == 4 and len(government['congressMembers']) == 0:
-                    empty_countries.append((country['name'], country['_id']))
-            # Always send an embed reporting the results (may be empty)
-            if len(empty_countries) == 0:
-                return
-            channel = guild.get_channel(config["channels"]["reports"]) if guild else None
-            if channel:
-                embed = self.build_takeover_embed(empty_countries)
-                await channel.send(embed=embed)
+        session = await get_shared_session()
+        empty_countries = []
+        countries_list = self.countries or []
+        for country in countries_list:
+            if active_countries is not None and len(active_countries) != 0:
+                if country['name'] in active_countries:
+                    continue
+            government = await get_country_government(country['_id'], session)
+            # country is empty, api displays only _id, country, __v, and congressMembers keys .
+            if government is not None and len(government.keys()) == 4 and len(government['congressMembers']) == 0:
+                empty_countries.append((country['name'], country['_id']))
+        # Always send an embed reporting the results (may be empty)
+        if len(empty_countries) == 0:
+            return
+        channel = guild.get_channel(config["channels"]["public"]) if guild else None
+        if channel:
+            embed = self.build_takeover_embed(empty_countries)
+            await channel.send(embed=embed)
 
     @takeover_countries.before_loop
     async def before_takeover_countries(self):
@@ -283,9 +289,8 @@ class Jobs(commands.Cog):
         now = datetime.now(timezone.utc)
         members = fight_role.members if fight_role else []
         seen_api_ids = set()
-
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
-            for member in members:
+        session = await get_shared_session()
+        for member in members:
                 api_id = None
                 try:
                     api_id = find_api_id_by_display_name(member.display_name) or find_api_id_by_discord_username(member.name)
@@ -397,7 +402,7 @@ class Jobs(commands.Cog):
                         try:
                             await member.send(text)
                         except Exception:
-                            channel = guild.get_channel(config.get('channels', {}).get('reports')) if guild else None
+                            channel = guild.get_channel(config.get('channels', {}).get('public')) if guild else None
                             if channel:
                                 try:
                                     await channel.send(f"{member.mention} — {text}")
@@ -434,6 +439,213 @@ class Jobs(commands.Cog):
                     del self.buff_check_cache[k]
             except Exception:
                 pass
+
+    @tasks.loop(minutes=BOUNTY_MONITOR_INTERVAL_MINUTES)
+    async def bounty_monitor(self):
+        """Checks active battles for bounties that are upcoming or currently active
+        (moneyPool != 0 and bountyEffectiveAt present). Sends a summary embed
+        to the public channel when any are found.
+        """
+        guild = self.bot.get_guild(config['guild'])
+        if guild is None:
+            return
+
+        session = await get_shared_session()
+        try:
+            battles = await get_active_battles(session)
+        except Exception:
+            battles = None
+
+        if not battles:
+            return
+
+        now = datetime.now(timezone.utc)
+        # Collect battles that have a positive moneyPool on either side and a bountyEffectiveAt
+        battles_with_bounty = []
+        for battle in battles:
+            bid = battle.get('_id') or battle.get('id') or battle.get('battleId') or None
+            attacker = battle.get('attacker') or {}
+            defender = battle.get('defender') or {}
+
+            try:
+                atk_pool = float(attacker.get('moneyPool') or 0)
+            except Exception:
+                atk_pool = 0.0
+            try:
+                def_pool = float(defender.get('moneyPool') or 0)
+            except Exception:
+                def_pool = 0.0
+
+            atk_bounty_at = attacker.get('bountyEffectiveAt')
+            def_bounty_at = defender.get('bountyEffectiveAt')
+
+            # Only consider pools strictly greater than 0
+            if (atk_pool > 0 and atk_bounty_at) or (def_pool > 0 and def_bounty_at):
+                battles_with_bounty.append({
+                    'battle': battle,
+                    'id': bid,
+                    'attacker_pool': atk_pool,
+                    'defender_pool': def_pool,
+                    'attacker_bounty_at': atk_bounty_at,
+                    'defender_bounty_at': def_bounty_at,
+                })
+
+        if not battles_with_bounty:
+            return
+
+        # Fetch country names for all referenced country ids
+        country_cache: dict = {}
+        async def resolve_country(cid):
+            if not cid:
+                return None
+            if cid in country_cache:
+                return country_cache[cid]
+            try:
+                cobj = await get_country(cid, session)
+            except Exception:
+                cobj = None
+            if isinstance(cobj, dict):
+                name = cobj.get('name') or cid
+            else:
+                name = cid
+            country_cache[cid] = name
+            return country_cache[cid]
+
+        # Resolve countries used in the selected battles
+        tasks_resolve = []
+        for entry in battles_with_bounty:
+            b = entry['battle']
+            atk_cid = (b.get('attacker') or {}).get('country')
+            def_cid = (b.get('defender') or {}).get('country')
+            if atk_cid:
+                tasks_resolve.append(resolve_country(atk_cid))
+            if def_cid:
+                tasks_resolve.append(resolve_country(def_cid))
+        # run resolves
+        await asyncio.gather(*tasks_resolve)
+
+        # For each side with a positive pool, send a single embed if it's new/changed
+        channel = guild.get_channel(config.get('channels', {}).get('public')) if guild else None
+        current_keys = set()
+        for entry in battles_with_bounty:
+            b = entry['battle']
+            bid = entry['id'] or 'unknown'
+            atk = b.get('attacker') or {}
+            dfn = b.get('defender') or {}
+            atk_cid = atk.get('country')
+            def_cid = dfn.get('country')
+            atk_name = country_cache.get(atk_cid, atk_cid or 'unknown')
+            def_name = country_cache.get(def_cid, def_cid or 'unknown')
+
+            # attacker side
+            if entry['attacker_pool'] > 0 and entry['attacker_bounty_at']:
+                key = f"{bid}:attacker"
+                current_keys.add(key)
+                prev = self.displayed_bounties.get(key)
+                if prev != entry['attacker_bounty_at']:
+                    # build embed for this bounty
+                    money_per = atk.get('moneyPer1kDamages')
+                    pool = entry['attacker_pool']
+                    battle_link = f"https://app.warera.io/battle/{bid}"
+                    embed = discord.Embed(
+                        title="Bounty Posted",
+                        description=f"[View battle]({battle_link})",
+                        color=discord.Color.orange()
+                    )
+                    embed.add_field(name="Attacker", value=f"{atk_name}", inline=True)
+                    embed.add_field(name="Defender", value=f"{def_name}", inline=True)
+                    # indicate which side placed the bounty
+                    embed.add_field(name="Posted by", value=f"{atk_name} (Attacker)", inline=False)
+                    # show moneyPer1kDamages / moneyPool
+                    embed.add_field(name="Reward", value=f"{money_per} per 1k damages / Pool: {pool}", inline=False)
+                    embed.set_footer(text=f"Battle {bid}")
+                    if channel:
+                        try:
+                            await channel.send(embed=embed)
+                        except Exception:
+                            pass
+                    self.displayed_bounties[key] = entry['attacker_bounty_at']
+
+            # defender side
+            if entry['defender_pool'] > 0 and entry['defender_bounty_at']:
+                key = f"{bid}:defender"
+                current_keys.add(key)
+                prev = self.displayed_bounties.get(key)
+                if prev != entry['defender_bounty_at']:
+                    money_per = dfn.get('moneyPer1kDamages')
+                    pool = entry['defender_pool']
+                    battle_link = f"https://app.warera.io/battle/{bid}"
+                    embed = discord.Embed(
+                        title="Bounty Posted",
+                        description=f"[View battle]({battle_link})",
+                        color=discord.Color.orange()
+                    )
+                    embed.add_field(name="Attacker", value=f"{atk_name}", inline=True)
+                    embed.add_field(name="Defender", value=f"{def_name}", inline=True)
+                    embed.add_field(name="Posted by", value=f"{def_name} (Defender)", inline=False)
+                    embed.add_field(name="Reward", value=f"{money_per} per 1k damages / Pool: {pool}", inline=False)
+                    embed.set_footer(text=f"Battle {bid}")
+                    if channel:
+                        try:
+                            await channel.send(embed=embed)
+                        except Exception:
+                            pass
+                    self.displayed_bounties[key] = entry['defender_bounty_at']
+
+        # prune displayed_bounties keys for battles that are no longer active
+        active_ids = set()
+        for b in battles:
+            bid = b.get('_id') or b.get('id') or b.get('battleId') or None
+            if bid:
+                active_ids.add(str(bid))
+
+        to_remove = [k for k in list(self.displayed_bounties.keys()) if k.split(':')[0] not in active_ids]
+        for k in to_remove:
+            try:
+                del self.displayed_bounties[k]
+            except Exception:
+                pass
+
+    @bounty_monitor.before_loop
+    async def before_bounty_monitor(self):
+        await self.bot.wait_until_ready()
+
+    def build_bounty_embed(self, items: list) -> discord.Embed:
+        if not items:
+            embed = discord.Embed(
+                title="Bounty Check",
+                description="No active or upcoming bounties found.",
+                color=discord.Color.green()
+            )
+            embed.set_footer(text="Total: 0")
+            return embed
+
+        embed = discord.Embed(
+            title="Active / Upcoming Bounties",
+            description="Battles with non-empty bounty pools:",
+            color=discord.Color.orange()
+        )
+
+        lines = []
+        for it in items:
+            bid = it.get('battle_id') or 'unknown'
+            side = it.get('side')
+            country = it.get('country') or 'unknown'
+            pool = it.get('moneyPool')
+            effective = it.get('effectiveAt')
+            lines.append(f"* Battle {bid} — {side} — Pool: {pool} — Effective: {effective} (country: {country})")
+
+        chunk = ""
+        for line in lines:
+            if len(chunk) + len(line) > 1000:
+                embed.add_field(name="Bounties", value=chunk, inline=False)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
+            embed.add_field(name="Bounties", value=chunk, inline=False)
+
+        embed.set_footer(text=f"Total: {len(items)}")
+        return embed
 
     def build_takeover_embed(self, countries) -> discord.Embed:
         if not countries:
