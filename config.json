@@ -47,10 +47,21 @@
             "id" : "699ea3e01ee17a2f8ede8fa9",
             "roleId": 1494963377884237905,
             "friendlyName": "WolvesOfDacia"
+        },
+        {
+            "id" : "69f1f280104e9a5760e1a3db",
+            "roleId": 1499804311398383799,
+            "friendlyName": "Structura"
+        },
+        {
+            "id" : "69e6c2aa78af10c96278b691",
+            "roleId": 1500138830403993811,
+            "friendlyName": "Vael Thuun"
         }
     ],
     "channels": {
-        "reports": 1465417729812074741
+        "reports": 1465417729812074741,
+        "public": 1465417729812074741
     },
     "active_countries": [
         "South Africa",

@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
 from config import config
+import utils.api as api
 
 intents = discord.Intents.default()
 intents.members = True
@@ -14,6 +15,12 @@ class WarEraBot(commands.Bot):
         await self.load_extension("cogs.tasks.jobs")
         await self.load_extension("cogs.commands.fight_status")
         guild = discord.Object(id=config["guild"])
+
+        # Initialize shared aiohttp session used by API helpers
+        try:
+            await api.get_shared_session()
+        except Exception:
+            pass
 
         self.tree.clear_commands(guild=guild)   # remove guild commands
         await self.tree.sync(guild=guild)       # apply removal
