@@ -14,6 +14,8 @@ class WarEraBot(commands.Bot):
     async def setup_hook(self):
         await self.load_extension("cogs.tasks.jobs")
         await self.load_extension("cogs.commands.fight_status")
+        await self.load_extension("cogs.commands.diplomacy")
+        await self.load_extension("cogs.commands.help")
         guild = discord.Object(id=config["guild"])
 
         # Initialize shared aiohttp session used by API helpers

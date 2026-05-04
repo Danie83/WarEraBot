@@ -130,6 +130,16 @@ async def get_all_countries(session, base_url="https://api2.warera.io/trpc/count
         return api_result
     except Exception:
         return None
+    
+async def get_all_country_names():
+    session = await get_shared_session()
+    countries = await get_all_countries(session)
+    if not countries:
+        return None
+    lst = []
+    for c in countries:
+        lst.append(c['name'])
+    return lst
 
 async def get_country_government(counrtyId, session, base_url="https://api2.warera.io/trpc/government.getByCountryId"):
     try:
@@ -231,6 +241,20 @@ async def get_fight_status(userId: str, session, member: discord.Member | None =
             'buff_end_at': buff_end_at,
             'buff_active': bool(buff_active),
         }
+    except Exception:
+        return None
+    
+async def get_military_unit(muId, session, base_url="https://api2.warera.io/trpc/mu.getById"):
+    try:
+        input_data = {'muId': muId}
+        params = {"input": json.dumps(input_data)}
+        data = await _get_with_retry(session, base_url, params=params)
+        if not data:
+            return None
+        api_result = data.get('result', {}).get('data')
+        if not api_result:
+            return None
+        return api_result
     except Exception:
         return None
 

@@ -12,6 +12,14 @@ DISCORD_TOKEN=your_discord_bot_token
 WARERA_API_KEY=your_warera_api_key
 ```
 
+Optionally, to enable automatic AWS DynamoDB table creation at startup, add these environment variables:
+
+```env
+AWS_ACCESS_KEY_ID=your_aws_access_key_id
+AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key
+AWS_REGION=us-east-1  # optional, defaults to us-east-1
+```
+
 The bot also expects guild/role/channel settings in `config.json`.
 
 ### 2) Run with Docker

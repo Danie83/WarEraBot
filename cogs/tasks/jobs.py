@@ -1,7 +1,7 @@
 import discord
 import asyncio
 from discord.ext import commands, tasks
-from utils.api import get_user, get_all_countries, get_country_government, get_user_info, get_shared_session, get_active_battles, get_country
+from utils.api import get_user, get_all_countries, get_country_government, get_user_info, get_shared_session, get_active_battles, get_country, get_military_unit
 from utils.db import init_db, save_user, find_api_id_by_display_name, find_api_id_by_discord_username
 from utils.computational import triangular
 from config import config
@@ -50,6 +50,7 @@ class Jobs(commands.Cog):
         self.takeover_countries.cancel()
         self.buff_monitor.cancel()
         self.bounty_monitor.cancel()
+
     async def get_countries(self):
         session = await get_shared_session()
         return await get_all_countries(session)
@@ -143,37 +144,93 @@ class Jobs(commands.Cog):
         military_units = config.get('military_units', [])
         mu_to_role = {unit['id'] : guild.get_role(unit['roleId']) for unit in military_units}
 
+        # Build a mapping of manager_api_id -> set of MU ids they manage.
+        # We need an active session to call the API.
+        session = await get_shared_session()
+        owners: dict = {}
+        for unit in military_units:
+            try:
+                mu_data = await get_military_unit(unit['id'], session)
+            except Exception:
+                mu_data = None
+            if not mu_data:
+                continue
+            # The API returns role.managers as an array of api user ids
+            managers = []
+            try:
+                managers = (mu_data.get('roles') or {}).get('managers') or []
+            except Exception:
+                managers = []
+            for mgr in managers:
+                # map manager api id to a set of unit ids (support multiple)
+                if mgr in owners:
+                    owners[mgr].add(unit['id'])
+                else:
+                    owners[mgr] = {unit['id']}
+
         members = set()
         if citizen:
             members.update(citizen.members)
         if newbie:
             members.update(newbie.members)
-            
+
         # track player display names added/removed per role
         added_members: dict = {}
         removed_members: dict = {}
-        session = await get_shared_session()
+
+        # For each member, determine the desired MU-related roles (their current MU
+        # plus any MU(s) they own/manage) then add/remove server roles to match.
         for member in members:
+            try:
                 user = await get_user(member.display_name, session)
-                if user is None or "mu" not in user.keys():
-                    continue
-                role = mu_to_role.get(user["mu"])
-                if role is None:
-                    continue
-                if role in member.roles:
-                    continue
-                roles_to_remove = [
-                    r for r in mu_to_role.values()
-                    if r and r in member.roles and r != role
-                ]
-                await member.add_roles(role, reason="Assigned Military Unit role.")
-                name = role.name if role else str(role.id)
-                added_members.setdefault(name, []).append(member.display_name)
-                if roles_to_remove:
+            except Exception:
+                user = None
+            if user is None:
+                continue
+
+            api_id = user.get('_id') if isinstance(user, dict) else None
+
+            # Desired roles set (discord.Role objects)
+            desired_roles = set()
+
+            # 1) Current MU role (if the user belongs to one)
+            mu_id = user.get('mu')
+            if mu_id:
+                r = mu_to_role.get(mu_id)
+                if r:
+                    desired_roles.add(r)
+
+            # 2) Owner/manager MU roles (if the user's api id is a manager)
+            if api_id and api_id in owners:
+                for owned_mu in owners.get(api_id, set()):
+                    r = mu_to_role.get(owned_mu)
+                    if r:
+                        desired_roles.add(r)
+
+            # Roles currently on the member that are MU roles we manage
+            current_mu_roles = {r for r in mu_to_role.values() if r and r in member.roles}
+
+            # Add roles that are desired but missing
+            to_add = [r for r in desired_roles if r not in member.roles]
+            if to_add:
+                try:
+                    await member.add_roles(*to_add, reason="Assigned Military Unit role.")
+                    for r in to_add:
+                        name = r.name if r else str(getattr(r, 'id', 'unknown'))
+                        added_members.setdefault(name, []).append(member.display_name)
+                except Exception:
+                    pass
+
+            # Remove MU roles that the member should no longer have (managed set minus desired)
+            roles_to_remove = [r for r in current_mu_roles if r not in desired_roles]
+            if roles_to_remove:
+                try:
                     await member.remove_roles(*roles_to_remove, reason="Removed unused Military Unit roles.")
                     for r in roles_to_remove:
-                        rname = r.name if r else str(r.id)
+                        rname = r.name if r else str(getattr(r, 'id', 'unknown'))
                         removed_members.setdefault(rname, []).append(member.display_name)
+                except Exception:
+                    pass
 
         # Send a summary embed for military unit role changes — only if there were changes
         channel = guild.get_channel(config["channels"]["reports"]) if guild else None
@@ -476,11 +533,20 @@ class Jobs(commands.Cog):
             except Exception:
                 def_pool = 0.0
 
+            try:
+                atk_money = float(attacker.get('moneyPer1kDamages') or 0)
+            except Exception:
+                atk_money = 0.0
+            try:
+                def_money = float(defender.get('moneyPer1kDamages') or 0)
+            except Exception:
+                def_money = 0.0
+
             atk_bounty_at = attacker.get('bountyEffectiveAt')
             def_bounty_at = defender.get('bountyEffectiveAt')
 
             # Only consider pools strictly greater than 0
-            if (atk_pool > 0 and atk_bounty_at) or (def_pool > 0 and def_bounty_at):
+            if (atk_pool > 0 and atk_bounty_at and atk_money >= 0.1) or (def_pool > 0 and def_bounty_at and def_money >= 0.1):
                 battles_with_bounty.append({
                     'battle': battle,
                     'id': bid,
