@@ -18,9 +18,18 @@ _shared_session: aiohttp.ClientSession | None = None
 async def get_shared_session() -> aiohttp.ClientSession:
     """Return a singleton ClientSession, creating it if needed."""
     global _shared_session
+    api_key = config.get('api')
     if _shared_session is None or getattr(_shared_session, 'closed', False):
-        headers = {'X-API-Key': config.get('api')}
+        headers = {'X-API-Key': api_key}
         _shared_session = aiohttp.ClientSession(headers=headers)
+    else:
+        # Ensure session uses current API key in case it was rotated at runtime
+        try:
+            if api_key and _shared_session.headers.get('X-API-Key') != api_key:
+                _shared_session.headers['X-API-Key'] = api_key
+        except Exception:
+            # Non-fatal: log and continue using existing session
+            logger.exception('Failed updating shared session headers')
     return _shared_session
 
 async def close_shared_session() -> None:
@@ -54,6 +63,15 @@ async def _get_with_retry(session, url, params=None, max_retries=5, initial_back
                         return None
                     continue
 
+                # Do not retry on client errors (4xx) except 429; report and bail out
+                if 400 <= response.status < 500:
+                    try:
+                        body = await response.text()
+                    except Exception:
+                        body = '<unreadable body>'
+                    logger.error('Client error %s from %s, body=%s', response.status, url, body)
+                    return None
+
                 # Retry on server errors
                 if 500 <= response.status < 600:
                     wait = min(initial_backoff * (backoff_factor ** attempt), max_backoff)
@@ -76,8 +94,8 @@ async def _get_with_retry(session, url, params=None, max_retries=5, initial_back
             if attempt >= max_retries:
                 logger.exception('Max retries reached for %s: %s', url, e)
                 return None
-        except Exception:
-            logger.exception('Unexpected error contacting %s', url)
+        except Exception as e:
+            logger.exception('Unexpected error contacting %s: %s', url, e)
             return None
 
 async def get_user(username, session, base_url="https://api2.warera.io/trpc/search.searchAnything"):
@@ -102,7 +120,8 @@ async def get_user(username, session, base_url="https://api2.warera.io/trpc/sear
                 PLAYER_CACHE[username] = user.get('_id')
                 return user
         return None
-    except Exception:
+    except Exception as e:
+        logger.exception('get_user failed: %s', e)
         return None
 
 async def get_user_info(userId, session, base_url="https://api2.warera.io/trpc/user.getUserLite"):
@@ -116,7 +135,8 @@ async def get_user_info(userId, session, base_url="https://api2.warera.io/trpc/u
         if not api_result:
             return None
         return api_result
-    except Exception:
+    except Exception as e:
+        logger.exception('get_user_info failed: %s', e)
         return None
 
 async def get_all_countries(session, base_url="https://api2.warera.io/trpc/country.getAllCountries"):
@@ -128,7 +148,8 @@ async def get_all_countries(session, base_url="https://api2.warera.io/trpc/count
         if not api_result:
             return None
         return api_result
-    except Exception:
+    except Exception as e:
+        logger.exception('get_all_countries failed: %s', e)
         return None
     
 async def get_all_country_names():
@@ -152,7 +173,8 @@ async def get_country_government(counrtyId, session, base_url="https://api2.ware
         if not api_result:
             return None
         return api_result
-    except Exception:
+    except Exception as e:
+        logger.exception('get_country_government failed: %s', e)
         return None
 
 async def get_fight_status(userId: str, session, member: discord.Member | None = None, base_url: str = "https://api2.warera.io/trpc/user.getUserLite") -> dict | None:
@@ -241,7 +263,8 @@ async def get_fight_status(userId: str, session, member: discord.Member | None =
             'buff_end_at': buff_end_at,
             'buff_active': bool(buff_active),
         }
-    except Exception:
+    except Exception as e:
+        logger.exception('get_fight_status failed for %s: %s', userId, e)
         return None
     
 async def get_military_unit(muId, session, base_url="https://api2.warera.io/trpc/mu.getById"):
@@ -255,7 +278,8 @@ async def get_military_unit(muId, session, base_url="https://api2.warera.io/trpc
         if not api_result:
             return None
         return api_result
-    except Exception:
+    except Exception as e:
+        logger.exception('get_military_unit failed: %s', e)
         return None
 
 async def request_military_units(input_data, session, base_url="https://api2.warera.io/trpc/mu.getManyPaginated"):
@@ -265,7 +289,8 @@ async def request_military_units(input_data, session, base_url="https://api2.war
         if not data:
             return None
         return data
-    except Exception:
+    except Exception as e:
+        logger.exception('request_military_units failed: %s', e)
         return None
 
 async def get_military_units(session, base_url="https://api2.warera.io/trpc/mu.getManyPaginated"):
@@ -297,7 +322,8 @@ async def get_military_units(session, base_url="https://api2.warera.io/trpc/mu.g
             next_cursor = data.get('nextCursor')
 
         return items
-    except Exception:
+    except Exception as e:
+        logger.exception('get_military_units failed: %s', e)
         return None
     
 async def get_active_battles(session, base_url="https://api2.warera.io/trpc/battle.getBattles"):
@@ -324,7 +350,8 @@ async def get_active_battles(session, base_url="https://api2.warera.io/trpc/batt
             next_cursor = data.get('nextCursor')
 
         return items
-    except Exception:
+    except Exception as e:
+        logger.exception('get_active_battles failed: %s', e)
         return None
     
 async def get_country(countryId, session, base_url="https://api2.warera.io/trpc/country.getCountryById"):
@@ -338,5 +365,6 @@ async def get_country(countryId, session, base_url="https://api2.warera.io/trpc/
         if not api_result:
             return None
         return api_result
-    except Exception:
+    except Exception as e:
+        logger.exception('get_country failed: %s', e)
         return None
