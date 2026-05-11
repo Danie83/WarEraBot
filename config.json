@@ -29,6 +29,11 @@
             "friendlyName": "PRAF-Academy"
         },
         {
+            "id" : "6a00e01a466b2bca6accbaae",
+            "roleId": 1413903312578674840,
+            "friendlyName": "PRAF-Bootcamp"
+        },
+        {
             "id" : "6873ed1806cf11a5f9dc3ecf",
             "roleId": 1413903246577373194,
             "friendlyName": "FNR"
@@ -37,8 +42,7 @@
             "id" : "697f917064b9c8386b918a92",
             "roleId": 1490292311303782562,
             "friendlyName": "SIAS"
-        }
-        ,
+        },
         {
             "id" : "69976c2fdcd6dac676a8f1ff",
             "roleId": 1494963502874366022,
