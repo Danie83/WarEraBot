@@ -603,57 +603,46 @@ class Jobs(commands.Cog):
             atk_name = country_cache.get(atk_cid, atk_cid or 'unknown')
             def_name = country_cache.get(def_cid, def_cid or 'unknown')
 
-            # attacker side
+            # attacker side: send a simple plain-text message instead of an embed
             if entry['attacker_pool'] > 0 and entry['attacker_bounty_at']:
                 key = f"{bid}:attacker"
                 current_keys.add(key)
                 prev = self.displayed_bounties.get(key)
                 if prev != entry['attacker_bounty_at']:
-                    # build embed for this bounty
-                    money_per = atk.get('moneyPer1kDamages')
-                    pool = entry['attacker_pool']
+                    try:
+                        money_per = float(atk.get('moneyPer1kDamages') or 0)
+                    except Exception:
+                        money_per = 0.0
+                    pool = round(float(entry['attacker_pool']), 2)
                     battle_link = f"https://app.warera.io/battle/{bid}"
-                    embed = discord.Embed(
-                        title="Bounty Posted",
-                        description=f"[View battle]({battle_link})",
-                        color=discord.Color.orange()
-                    )
-                    embed.add_field(name="Attacker", value=f"{atk_name}", inline=True)
-                    embed.add_field(name="Defender", value=f"{def_name}", inline=True)
-                    # indicate which side placed the bounty
-                    embed.add_field(name="Posted by", value=f"{atk_name} (Attacker)", inline=False)
-                    # show moneyPer1kDamages / moneyPool
-                    embed.add_field(name="Reward", value=f"{money_per} per 1k damages / Pool: {pool}", inline=False)
-                    embed.set_footer(text=f"Battle {bid}")
+                    # Format: "moneyPer/pool from <country_A> (Attacker) against <country_B> (Defender) — View battle: <link>"
+                    msg = f"{money_per}/{pool} from {atk_name} (Attacker) against {def_name} (Defender) — [View Battle]({battle_link})"
                     if channel:
                         try:
-                            await channel.send(embed=embed)
+                            sent = await channel.send(msg)
+                            await sent.edit(suppress=True)
                         except Exception:
                             pass
                     self.displayed_bounties[key] = entry['attacker_bounty_at']
 
-            # defender side
+            # defender side: send a simple plain-text message instead of an embed
             if entry['defender_pool'] > 0 and entry['defender_bounty_at']:
                 key = f"{bid}:defender"
                 current_keys.add(key)
                 prev = self.displayed_bounties.get(key)
                 if prev != entry['defender_bounty_at']:
-                    money_per = dfn.get('moneyPer1kDamages')
-                    pool = entry['defender_pool']
+                    try:
+                        money_per = float(dfn.get('moneyPer1kDamages') or 0)
+                    except Exception:
+                        money_per = 0.0
+                    pool = round(float(entry['defender_pool']), 2)
                     battle_link = f"https://app.warera.io/battle/{bid}"
-                    embed = discord.Embed(
-                        title="Bounty Posted",
-                        description=f"[View battle]({battle_link})",
-                        color=discord.Color.orange()
-                    )
-                    embed.add_field(name="Attacker", value=f"{atk_name}", inline=True)
-                    embed.add_field(name="Defender", value=f"{def_name}", inline=True)
-                    embed.add_field(name="Posted by", value=f"{def_name} (Defender)", inline=False)
-                    embed.add_field(name="Reward", value=f"{money_per} per 1k damages / Pool: {pool}", inline=False)
-                    embed.set_footer(text=f"Battle {bid}")
+                    # Format: "moneyPer/pool from <country_A> (Defender) against <country_B> (Attacker) — View battle: <link>"
+                    msg = f"{money_per}/{pool} from {def_name} (Defender) against {atk_name} (Attacker) — [View Battle]({battle_link})"
                     if channel:
                         try:
-                            await channel.send(embed=embed)
+                            sent = await channel.send(msg)
+                            await sent.edit(suppress=True)
                         except Exception:
                             pass
                     self.displayed_bounties[key] = entry['defender_bounty_at']
