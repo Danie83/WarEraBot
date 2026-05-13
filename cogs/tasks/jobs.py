@@ -272,8 +272,17 @@ class Jobs(commands.Cog):
                     if api_id:
                         info = await get_user_info(api_id, session)
                         if info:
-                            # update stored mapping with the current display name
-                            save_user(member.name, member.display_name, api_id)
+                            # Prefer the API username as the authoritative display name
+                            new_display = info.get('username') or None
+                            # If the API reports a different display name, try to update the member's server nickname
+                            if new_display and new_display != member.display_name:
+                                try:
+                                    await member.edit(nick=new_display, reason="Sync WarEra username")
+                                except Exception:
+                                    # ignore failures (permissions, hierarchy, etc.)
+                                    pass
+                            # update stored mapping with the current discord username and latest display name
+                            save_user(member.name, new_display or member.display_name, api_id)
                             continue
                 except Exception:
                     pass
@@ -283,15 +292,27 @@ class Jobs(commands.Cog):
                     api_id = user.get('_id') if isinstance(user, dict) else None
                     if api_id:
                         save_user(member.name, member.display_name, api_id)
-                except Exception:
+                except Exception as e:
                     pass
+                    unidentified.append(member)
         if len(unidentified) == 0:
             return None
         # Always send an embed, even if there are no unidentified players
         channel = guild.get_channel(config["channels"]["reports"]) if guild else None
         if channel:
-            embed = self.build_unidentified_embed(unidentified)
-            await channel.send(embed=embed)
+            embeds = self.build_unidentified_embed(unidentified)
+            # builder returns a list of embeds; send them sequentially
+            if isinstance(embeds, list):
+                for e in embeds:
+                    try:
+                        await channel.send(embed=e)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    await channel.send(embed=embeds)
+                except Exception:
+                    pass
 
     @unidentified_members.before_loop
     async def before_unidentified_members(self):
@@ -729,7 +750,10 @@ class Jobs(commands.Cog):
         embed.set_footer(text=f"Total: {len(countries)}")
         return embed
         
-    def build_unidentified_embed(self, members: list[discord.Member]) -> discord.Embed:
+    def build_unidentified_embed(self, members: list[discord.Member]) -> list:
+        """Return a list of embeds (one or more) that together list unidentified members.
+        Splits content so no single embed exceeds Discord's embed size limits.
+        """
         if not members:
             embed = discord.Embed(
                 title="Unidentified Players Check",
@@ -737,24 +761,47 @@ class Jobs(commands.Cog):
                 color=discord.Color.green()
             )
             embed.set_footer(text="Total: 0")
-            return embed
+            return [embed]
 
-        embed = discord.Embed(
-            title="Unidentified Players Found",
-            description="The following members could not be matched:",
-            color=discord.Color.orange()
-        )
         lines = [f"* {m.display_name} ('{m.id}')" for m in members]
+
+        # First split into field-sized chunks (<=1000 chars per field)
+        field_chunks: list[str] = []
         chunk = ""
         for line in lines:
             if len(chunk) + len(line) > 1000:
-                embed.add_field(name="Players", value=chunk, inline=False)
+                field_chunks.append(chunk)
                 chunk = ""
             chunk += line + "\n"
         if chunk:
-            embed.add_field(name="Players", value=chunk, inline=False)
-        embed.set_footer(text=f"Total: {len(members)}")
-        return embed
+            field_chunks.append(chunk)
+
+        # Now group fields into embeds without exceeding a safe embed size limit
+        EMBED_CHAR_LIMIT = 5800  # keep some headroom under 6000
+        title = "Unidentified Players Found"
+        description = "The following members could not be matched:"
+
+        embeds: list[discord.Embed] = []
+        current_embed = discord.Embed(title=title, description=description, color=discord.Color.orange())
+        current_length = len(title) + len(description)
+
+        for field_value in field_chunks:
+            field_name = "Players"
+            field_len = len(field_name) + len(field_value)
+            # Start a new embed if adding this field would exceed the safe limit
+            if current_length + field_len > EMBED_CHAR_LIMIT and len(current_embed.fields) > 0:
+                current_embed.set_footer(text=f"Total: {len(members)}")
+                embeds.append(current_embed)
+                current_embed = discord.Embed(title=title, description=description, color=discord.Color.orange())
+                current_length = len(title) + len(description)
+
+            current_embed.add_field(name=field_name, value=field_value, inline=False)
+            current_length += field_len
+
+        # Append last embed
+        current_embed.set_footer(text=f"Total: {len(members)}")
+        embeds.append(current_embed)
+        return embeds
     
     def build_skill_roles_embed(self, stats: dict) -> discord.Embed:
         economy_added = stats.get('economy_added', [])
