@@ -368,3 +368,31 @@ async def get_country(countryId, session, base_url="https://api2.warera.io/trpc/
     except Exception as e:
         logger.exception('get_country failed: %s', e)
         return None
+    
+async def get_mercenary_auctions(session, base_url="https://api2.warera.io/trpc/mercenaryContractAuction.getPaginatedAuctions"):
+    try:
+        input_data = {"limit": 50, "status": "active"}
+        params = {"input": json.dumps(input_data)}
+        mus = await _get_with_retry(session, base_url, params=params)
+        if not mus:
+            return None
+
+        data = mus.get('result', {}).get('data') or {}
+        items = data.get('items') or []
+        next_cursor = data.get('nextCursor')
+
+        while next_cursor:
+            input_data['cursor'] = next_cursor
+            params = {"input": json.dumps(input_data)}
+            mus = await _get_with_retry(session, base_url, params=params)
+            if not mus:
+                break
+            data = mus.get('result', {}).get('data') or {}
+            new_items = data.get('items') or []
+            items += new_items
+            next_cursor = data.get('nextCursor')
+
+        return items
+    except Exception as e:
+        logger.exception('get_mercenary_auctions failed: %s', e)
+        return None

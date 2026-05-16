@@ -1,7 +1,7 @@
 import discord
 import asyncio
 from discord.ext import commands, tasks
-from utils.api import get_user, get_all_countries, get_country_government, get_user_info, get_shared_session, get_active_battles, get_country, get_military_unit
+from utils.api import get_user, get_all_countries, get_country_government, get_user_info, get_shared_session, get_active_battles, get_country, get_military_unit, get_mercenary_auctions
 from utils.db import init_db, save_user, find_api_id_by_display_name, find_api_id_by_discord_username, get_record_by_api_id
 from utils.computational import triangular
 from config import config
@@ -17,6 +17,8 @@ DEFAULT_SKIP_HOURS = 1
 BUFF_MONITOR_INTERVAL_MINUTES = 10
 # how often the bounty monitor runs (minutes)
 BOUNTY_MONITOR_INTERVAL_MINUTES = 1
+# how often the mercenary auction monitor runs (minutes)
+MERCENARY_MONITOR_INTERVAL_MINUTES = 1
 # effective notify threshold to account for the monitor interval so users are
 # guaranteed to be notified at least NOTIFY_THRESHOLD_MINUTES before expiry
 EFFECTIVE_NOTIFY_MINUTES = NOTIFY_THRESHOLD_MINUTES
@@ -28,6 +30,8 @@ class Jobs(commands.Cog):
         # track displayed bounties: key -> last seen bountyEffectiveAt
         # key format: "{battle_id}:{side}" where side is 'attacker' or 'defender'
         self.displayed_bounties: dict = {}
+        # track displayed mercenary auctions: auction_id -> token (updatedAt/currentPayout)
+        self.displayed_auctions: dict = {}
         # cache for buff checks: api_id -> { next_check: datetime, notified_for_end_at: str|None }
         self.buff_check_cache: dict = {}
         self.countries = None
@@ -43,6 +47,7 @@ class Jobs(commands.Cog):
         self.takeover_countries.start()
         self.buff_monitor.start()
         self.bounty_monitor.start()
+        self.mercenary_monitor.start()
 
     def cog_unload(self):
         self.skill_roles.cancel()
@@ -52,6 +57,7 @@ class Jobs(commands.Cog):
         self.takeover_countries.cancel()
         self.buff_monitor.cancel()
         self.bounty_monitor.cancel()
+        self.mercenary_monitor.cancel()
 
     async def get_countries(self):
         session = await get_shared_session()
@@ -768,7 +774,7 @@ class Jobs(commands.Cog):
                     pool = round(float(entry['defender_pool']), 2)
                     battle_link = f"https://app.warera.io/battle/{bid}"
                     # Format: "moneyPer/pool from <country_A> (Defender) against <country_B> (Attacker) — View battle: <link>"
-                    msg = f"{money_per}/{pool} from {def_name} (Defender) against {atk_name} (Attacker) — [View Battle]({battle_link})"
+                    msg = f"**[BOUNTY]** {money_per}/{pool} from {def_name} (Defender) against {atk_name} (Attacker) — [View Battle]({battle_link})"
                     if channel:
                         try:
                             sent = await channel.send(msg)
@@ -793,6 +799,89 @@ class Jobs(commands.Cog):
 
     @bounty_monitor.before_loop
     async def before_bounty_monitor(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(minutes=MERCENARY_MONITOR_INTERVAL_MINUTES)
+    async def mercenary_monitor(self):
+        """Checks active mercenary contract auctions and posts new/changed ones.
+
+        Message format: "<country_name> posted a <initialPerK>/<budget> contract for <forCountrySide> side."
+        """
+        guild = self.bot.get_guild(config['guild'])
+        if guild is None:
+            return
+
+        session = await get_shared_session()
+        try:
+            auctions = await get_mercenary_auctions(session)
+        except Exception:
+            auctions = None
+
+        if not auctions:
+            return
+
+        channel = guild.get_channel(config.get('channels', {}).get('public')) if guild else None
+        if channel is None:
+            return
+
+        # simple cache for country names
+        country_cache: dict = {}
+        async def resolve_country(cid):
+            if not cid:
+                return 'unknown'
+            if cid in country_cache:
+                return country_cache[cid]
+            try:
+                cobj = await get_country(cid, session)
+            except Exception:
+                cobj = None
+            name = cobj.get('name') if isinstance(cobj, dict) else str(cid)
+            country_cache[cid] = name
+            return name
+
+        seen_ids = set()
+        for a in auctions:
+            aid = a.get('_id')
+            if not aid:
+                continue
+            seen_ids.add(aid)
+
+            status = a.get('status')
+            # only post active auctions
+            if status != 'active':
+                continue
+
+            # token to detect changes (prefer updatedAt, fallback to createdAt or currentPayout)
+            token = a.get('updatedAt') or a.get('createdAt') or a.get('currentPayout')
+            prev = self.displayed_auctions.get(aid)
+            if prev == token:
+                continue
+
+            country_name = await resolve_country(a.get('country') or a.get('forCountry'))
+            initial = a.get('initialPerK')
+            budget = a.get('budget')
+            side = a.get('forCountrySide') or a.get('forCountrySide')
+            battle_link = f"https://app.warera.io/battle/{a.get('battle')}"
+            text = f"**[CONTRACT]** {country_name} posted a {initial}/{budget} contract for {side} side — [View Battle]({battle_link})"
+            try:
+                sent = await channel.send(text)
+                await sent.edit(suppress=True)
+            except Exception:
+                pass
+
+            # record token
+            self.displayed_auctions[aid] = token
+
+        # prune auctions that are no longer active
+        to_prune = [k for k in list(self.displayed_auctions.keys()) if k not in seen_ids]
+        for k in to_prune:
+            try:
+                del self.displayed_auctions[k]
+            except Exception:
+                pass
+
+    @mercenary_monitor.before_loop
+    async def before_mercenary_monitor(self):
         await self.bot.wait_until_ready()
 
     def build_bounty_embed(self, items: list) -> discord.Embed:
