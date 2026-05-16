@@ -820,7 +820,7 @@ class Jobs(commands.Cog):
         if not auctions:
             return
 
-        channel = guild.get_channel(config.get('channels', {}).get('public')) if guild else None
+        channel = guild.get_channel(config.get('channels', {}).get('contracts')) if guild else None
         if channel is None:
             return
 
